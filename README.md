@@ -2,6 +2,8 @@
 
 > An interactive AI-powered scam awareness training game — chat with a live scammer bot and learn to recognize manipulation tactics in real time.
 
+🥇 **1st Place Winner — UTA Hackathon 2026**
+
 ### [▶ Live Demo → scam-agent.kclynguyenkhanh.workers.dev](https://scam-agent.kclynguyenkhanh.workers.dev/)
 
 ---
