@@ -28,12 +28,14 @@ const ChatMessage = ({ sender, text, timestamp, onFlag, flagged, feedbackText }:
         {isBot && onFlag && (
           <button
             onClick={onFlag}
-            className={`flex items-center gap-1 text-[10px] transition-colors ${
-              flagged ? "text-warning" : "text-muted-foreground hover:text-primary"
+            className={`flex items-center gap-1 text-[10px] font-medium transition-all ${
+              flagged
+                ? "text-warning"
+                : "text-primary border border-primary/40 rounded-full px-2 py-0.5 animate-pulse hover:animate-none hover:bg-primary hover:text-primary-foreground"
             }`}
           >
             <Flag className="w-3 h-3" />
-            {flagged ? "Flagged" : "Flag Tactic"}
+            {flagged ? "Flagged" : "Flag Tactic ↑"}
           </button>
         )}
       </div>

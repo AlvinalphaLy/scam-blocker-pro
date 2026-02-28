@@ -11,6 +11,14 @@ export default defineConfig(({ mode }) => ({
     hmr: {
       overlay: false,
     },
+    proxy: {
+      // Forward /agents/* to the Cloudflare Worker (wrangler dev on :8787)
+      "/agents": {
+        target: "http://localhost:8787",
+        changeOrigin: true,
+        ws: true, // WebSocket support for real-time streaming
+      },
+    },
   },
   plugins: [react(), mode === "development" && componentTagger()].filter(Boolean),
   resolve: {

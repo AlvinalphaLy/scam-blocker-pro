@@ -1,6 +1,7 @@
+import { useState } from "react";
 import { useLocation, useNavigate } from "react-router-dom";
 import { Button } from "@/components/ui/button";
-import { Trophy, Target, CheckCircle, XCircle, Lightbulb, ArrowRight, RotateCcw } from "lucide-react";
+import { Trophy, Target, CheckCircle, XCircle, Lightbulb, ArrowRight } from "lucide-react";
 import { Progress } from "@/components/ui/progress";
 
 const TIPS = [
@@ -21,6 +22,7 @@ const Summary = () => {
     flaggedTactics: string[];
     missedTactics: string[];
     streak: number;
+    difficulty?: "easy" | "medium" | "hard";
   } | null;
 
   const score = state?.score ?? 0;
@@ -28,6 +30,15 @@ const Summary = () => {
   const flaggedTactics = state?.flaggedTactics ?? [];
   const missedTactics = state?.missedTactics ?? [];
   const streak = state?.streak ?? 0;
+  const difficulty = state?.difficulty ?? "medium";
+
+  const [selectedDifficulty, setSelectedDifficulty] = useState<"easy" | "medium" | "hard">(difficulty);
+
+  const DIFFICULTY_OPTIONS = [
+    { value: "easy" as const, label: "Easy", desc: "1 tactic, friendly", classes: "border-success text-success data-[active=true]:bg-success/10" },
+    { value: "medium" as const, label: "Medium", desc: "2–3 tactics, moderate", classes: "border-warning text-warning data-[active=true]:bg-warning/10" },
+    { value: "hard" as const, label: "Hard", desc: "3–4 tactics, aggressive", classes: "border-destructive text-destructive data-[active=true]:bg-destructive/10" },
+  ];
 
   return (
     <div className="min-h-screen bg-background flex items-center justify-center p-4 md:p-8">
@@ -123,22 +134,33 @@ const Summary = () => {
         </div>
 
         {/* Actions */}
-        <div className="flex flex-col sm:flex-row items-center justify-center gap-3">
-          <Button
-            onClick={() => navigate("/game")}
-            className="bg-primary text-primary-foreground hover:bg-primary/90 font-mono px-6 group"
-          >
-            Try Another Scenario
-            <ArrowRight className="ml-2 w-4 h-4 group-hover:translate-x-1 transition-transform" />
-          </Button>
-          <Button
-            variant="outline"
-            onClick={() => navigate("/game")}
-            className="border-glow text-foreground hover:bg-secondary font-mono px-6"
-          >
-            <RotateCcw className="mr-2 w-4 h-4" />
-            Increase Difficulty
-          </Button>
+        <div className="space-y-4">
+          <p className="text-xs text-muted-foreground font-mono text-center uppercase tracking-wider">Select Difficulty</p>
+          <div className="grid grid-cols-3 gap-3">
+            {DIFFICULTY_OPTIONS.map((opt) => (
+              <button
+                key={opt.value}
+                data-active={selectedDifficulty === opt.value}
+                onClick={() => setSelectedDifficulty(opt.value)}
+                className={`rounded-xl border-2 px-3 py-4 text-center transition-all font-mono ${opt.classes} ${
+                  selectedDifficulty === opt.value ? "ring-2 ring-offset-2 ring-offset-background" : "opacity-60 hover:opacity-100"
+                }`}
+                style={selectedDifficulty === opt.value ? { ringColor: "currentColor" } : {}}
+              >
+                <div className="font-bold text-sm">{opt.label}</div>
+                <div className="text-[10px] mt-1 text-muted-foreground">{opt.desc}</div>
+              </button>
+            ))}
+          </div>
+          <div className="flex justify-center pt-1">
+            <Button
+              onClick={() => navigate("/game", { state: { difficulty: selectedDifficulty } })}
+              className="bg-primary text-primary-foreground hover:bg-primary/90 font-mono px-8 group"
+            >
+              Play
+              <ArrowRight className="ml-2 w-4 h-4 group-hover:translate-x-1 transition-transform" />
+            </Button>
+          </div>
         </div>
       </div>
     </div>

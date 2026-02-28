@@ -1,6 +1,6 @@
-import { useState, useRef, useEffect } from "react";
-import { useNavigate } from "react-router-dom";
-import { Shield, RotateCcw, Send } from "lucide-react";
+import { useState, useRef, useEffect, useMemo } from "react";
+import { useNavigate, useLocation } from "react-router-dom";
+import { Shield, RotateCcw, Send, Flag } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Badge } from "@/components/ui/badge";
@@ -8,53 +8,46 @@ import ChatMessage from "@/components/ChatMessage";
 import TypingIndicator from "@/components/TypingIndicator";
 import FlagTacticModal from "@/components/FlagTacticModal";
 import GameSidebar from "@/components/GameSidebar";
+import { useAgent } from "agents/react";
+import { useAgentChat } from "@cloudflare/ai-chat/react";
 
-interface Message {
-  id: number;
-  sender: "bot" | "user";
-  text: string;
-  timestamp: string;
-  tactics?: string[];
+// --- Helpers ---
+
+interface MessageOverride {
   flagged?: boolean;
   feedbackText?: string;
 }
 
-const SCENARIO = {
-  name: "Bank Account Alert",
-  difficulty: "Medium",
-  messages: [
-    {
-      text: "⚠️ URGENT: This is the Security Department of National Trust Bank. We've detected unauthorized access to your account ending in **4829**.",
-      tactics: ["Authority", "Fear"],
-      delay: 1000,
-    },
-    {
-      text: "Your account will be PERMANENTLY LOCKED within the next 15 minutes unless you verify your identity immediately. This is time-sensitive.",
-      tactics: ["False Urgency", "Fear"],
-      delay: 3000,
-    },
-    {
-      text: "Please click this secure link to verify: https://national-trust-secure-verify.com/auth and enter your account credentials to prevent suspension.",
-      tactics: ["Suspicious Link", "Impersonation"],
-      delay: 3000,
-    },
-    {
-      text: "I understand your concern. Only 3 customers received this priority alert today. As a valued customer, we're offering a $50 security credit once verified.",
-      tactics: ["Scarcity", "Reward Bait"],
-      delay: 3000,
-    },
-    {
-      text: "If you don't respond within the next 5 minutes, we'll have to report this as a compromised account to the federal authorities. Please act now.",
-      tactics: ["Fear", "False Urgency", "Authority"],
-      delay: 3000,
-    },
-  ],
-};
+type Part = { type: string; text?: string };
 
-const getTime = () => {
-  const now = new Date();
-  return now.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
-};
+// The model prepends every response with:
+//   TACTICS: Tactic1, Tactic2
+//   ---
+//   Actual message text...
+// These helpers parse that format.
+
+function getRawText(parts: Part[]): string {
+  return parts
+    .filter((p) => p.type === "text")
+    .map((p) => p.text ?? "")
+    .join("");
+}
+
+function getMessageText(parts: Part[]): string {
+  const raw = getRawText(parts);
+  const sep = raw.indexOf("\n---\n");
+  if (sep !== -1) return raw.slice(sep + 5).trim();
+  // Still streaming the TACTICS header — hide until the separator arrives
+  if (raw.trimStart().startsWith("TACTICS:")) return "";
+  return raw.trim();
+}
+
+function getMessageTactics(parts: Part[]): string[] {
+  const raw = getRawText(parts);
+  const match = raw.match(/^TACTICS:\s*(.+?)(?:\n|$)/);
+  if (!match) return [];
+  return match[1].split(",").map((t) => t.trim()).filter(Boolean);
+}
 
 const QUICK_RESPONSES = [
   "Ask for verification",
@@ -62,112 +55,143 @@ const QUICK_RESPONSES = [
   "Request official website",
 ];
 
+// Hard cap — prevents runaway agent loops. Game ends manually via Finish button.
+const AGENT_MESSAGE_HARD_LIMIT = 20;
+
+const DIFFICULTY_LABELS: Record<string, string> = { easy: "Easy", medium: "Medium", hard: "Hard" };
+const DIFFICULTY_CLASSES: Record<string, string> = {
+  easy: "border-success text-success",
+  medium: "border-warning text-warning",
+  hard: "border-destructive text-destructive",
+};
+
 const GameScreen = () => {
   const navigate = useNavigate();
-  const [messages, setMessages] = useState<Message[]>([]);
+  const location = useLocation();
+  const difficulty = (location.state as { difficulty?: string } | null)?.difficulty ?? "medium";
+
+  // Stable session ID — persists across React 19 Suspense unmount/remount cycles.
+  // Stored as state so updating it (on restart) causes useAgent to reconnect to a new Durable Object.
+  const [sessionId, setSessionId] = useState(() => {
+    const key = "scam-game-session-id";
+    let id = sessionStorage.getItem(key);
+    if (!id) {
+      id = crypto.randomUUID();
+      sessionStorage.setItem(key, id);
+    }
+    return id;
+  });
+
+  // UI-only overrides layered on top of agent messages (flags, feedback)
+  const [overrides, setOverrides] = useState<Map<string, MessageOverride>>(new Map());
   const [input, setInput] = useState("");
-  const [botIndex, setBotIndex] = useState(0);
-  const [isTyping, setIsTyping] = useState(false);
   const [flagModalOpen, setFlagModalOpen] = useState(false);
-  const [flagTargetId, setFlagTargetId] = useState<number | null>(null);
+  const [flagTargetId, setFlagTargetId] = useState<string | null>(null);
+
+  // Scoring
   const [score, setScore] = useState(0);
   const [correctFlags, setCorrectFlags] = useState(0);
   const [totalFlags, setTotalFlags] = useState(0);
   const [streak, setStreak] = useState(0);
-  const [riskLevel, setRiskLevel] = useState(0);
   const [flaggedTactics, setFlaggedTactics] = useState<string[]>([]);
-  const [missedTactics, setMissedTactics] = useState<string[]>([]);
+
   const chatEndRef = useRef<HTMLDivElement>(null);
+  const gameStartedRef = useRef(false);
+  // Ref so onOpen can call sendMessage without a circular dep on useAgentChat
+  const sendMessageRef = useRef<((msg: { text: string }) => void) | null>(null);
 
-  const scrollToBottom = () => {
-    chatEndRef.current?.scrollIntoView({ behavior: "smooth" });
-  };
-
-  useEffect(scrollToBottom, [messages, isTyping]);
-
-  // Send next bot message
-  const sendBotMessage = (index: number) => {
-    if (index >= SCENARIO.messages.length) {
-      // Game over
-      setTimeout(() => {
-        navigate("/summary", {
-          state: {
-            score,
-            accuracy: totalFlags > 0 ? Math.round((correctFlags / totalFlags) * 100) : 0,
-            flaggedTactics,
-            missedTactics: getMissedTactics(),
-            streak,
-          },
-        });
-      }, 1500);
-      return;
-    }
-
-    setIsTyping(true);
-    setTimeout(() => {
-      setIsTyping(false);
-      const msg: Message = {
-        id: Date.now(),
-        sender: "bot",
-        text: SCENARIO.messages[index].text,
-        tactics: SCENARIO.messages[index].tactics,
-        timestamp: getTime(),
-      };
-      setMessages((prev) => [...prev, msg]);
-      setBotIndex(index + 1);
-
-      // Increase risk if previous bot message wasn't flagged
-      if (index > 0) {
-        const prevBotMsg = messages.filter((m) => m.sender === "bot").at(-1);
-        if (prevBotMsg && !prevBotMsg.flagged) {
-          setRiskLevel((prev) => Math.min(100, prev + 15));
-          // Track missed tactics
-          if (prevBotMsg.tactics) {
-            setMissedTactics((prev) => [...prev, ...prevBotMsg.tactics!.filter((t) => !prev.includes(t))]);
-          }
-        }
+  // Connect to the Cloudflare ScamAgent Durable Object.
+  // Only send __GAME_START__ once the WebSocket is actually open — this prevents
+  // firing into a closed socket and causing the flood of /get-messages requests.
+  const agent = useAgent({
+    agent: "ScamAgent",
+    name: sessionId,
+    onOpen: () => {
+      if (!gameStartedRef.current) {
+        gameStartedRef.current = true;
+        sendMessageRef.current?.({ text: `__GAME_START__:${difficulty}` });
       }
-    }, SCENARIO.messages[index].delay);
-  };
+    },
+  });
 
-  const getMissedTactics = () => {
-    const allTactics = SCENARIO.messages.flatMap((m) => m.tactics);
-    return [...new Set(allTactics.filter((t) => !flaggedTactics.includes(t)))];
-  };
+  // null is the library's sentinel: skips the /get-messages fetch AND the internal use() call
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const { messages, sendMessage, clearHistory, status } = useAgentChat({
+    agent,
+    getInitialMessages: null as any,
+  });
 
-  // Start the game
+  // Keep the ref in sync so onOpen always has the latest sendMessage
+  sendMessageRef.current = sendMessage;
+
+  // --- Derived ---
+
+  // Hide the hidden game-start trigger from the UI
+  const displayMessages = useMemo(
+    () =>
+      messages.filter(
+        (m) =>
+          !(m.role === "user" && getMessageText(m.parts as Part[]).startsWith("__GAME_START__"))
+      ),
+    [messages]
+  );
+
+  const botMessages = useMemo(
+    () =>
+      displayMessages.filter(
+        (m) => m.role === "assistant" && getMessageText(m.parts as Part[]).trim().length > 0
+      ),
+    [displayMessages]
+  );
+
+  const accuracy = totalFlags > 0 ? Math.round((correctFlags / totalFlags) * 100) : 100;
+
+  // Risk = % of bot messages not yet flagged (flags all → risk 0, flags none → risk 100)
+  const riskLevel = useMemo(() => {
+    if (botMessages.length === 0) return 0;
+    const unflagged = botMessages.filter((m) => !overrides.get(m.id)?.flagged).length;
+    return Math.round((unflagged / botMessages.length) * 100);
+  }, [botMessages, overrides]);
+
+  // --- Effects ---
+
+  // Auto-scroll
   useEffect(() => {
-    sendBotMessage(0);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+    chatEndRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [displayMessages, status]);
+
+  // --- Handlers ---
+
+  const gameOver = botMessages.length >= AGENT_MESSAGE_HARD_LIMIT;
+
+  const handleFinish = () => {
+    const allBotTactics = botMessages.flatMap((m) => getMessageTactics(m.parts as Part[]));
+    const missed = [...new Set(allBotTactics.filter((t) => !flaggedTactics.includes(t)))];
+    navigate("/summary", {
+      state: { score, accuracy, flaggedTactics, missedTactics: missed, streak, difficulty },
+    });
+  };
 
   const handleSend = (text?: string) => {
     const msgText = text || input.trim();
-    if (!msgText) return;
-
-    const userMsg: Message = {
-      id: Date.now(),
-      sender: "user",
-      text: msgText,
-      timestamp: getTime(),
-    };
-    setMessages((prev) => [...prev, userMsg]);
+    if (!msgText || status === "streaming" || gameOver) return;
+    sendMessage({ text: msgText });
     setInput("");
-
-    // Trigger next bot message
-    setTimeout(() => sendBotMessage(botIndex), 800);
   };
 
-  const handleFlag = (msgId: number) => {
+  const handleFlag = (msgId: string) => {
     setFlagTargetId(msgId);
     setFlagModalOpen(true);
   };
 
   const handleFlagSubmit = (selectedTactics: string[]) => {
-    const targetMsg = messages.find((m) => m.id === flagTargetId);
-    if (!targetMsg || !targetMsg.tactics) return;
+    if (!flagTargetId) return;
 
-    const correct = selectedTactics.filter((t) => targetMsg.tactics!.includes(t));
+    const targetMsg = messages.find((m) => m.id === flagTargetId);
+    if (!targetMsg) return;
+
+    const correctTactics = getMessageTactics(targetMsg.parts as Part[]);
+    const correct = selectedTactics.filter((t) => correctTactics.includes(t));
     const isCorrect = correct.length > 0;
 
     setTotalFlags((prev) => prev + selectedTactics.length);
@@ -176,7 +200,6 @@ const GameScreen = () => {
     if (isCorrect) {
       setScore((prev) => prev + correct.length * 100);
       setStreak((prev) => prev + 1);
-      setRiskLevel((prev) => Math.max(0, prev - 10));
       setFlaggedTactics((prev) => [...new Set([...prev, ...correct])]);
     } else {
       setStreak(0);
@@ -184,47 +207,82 @@ const GameScreen = () => {
 
     const feedback = isCorrect
       ? `✓ Correct! You identified: ${correct.join(", ")}`
-      : `✗ Not quite. The tactics here were: ${targetMsg.tactics.join(", ")}`;
+      : `✗ Not quite. The tactics were: ${correctTactics.join(", ")}`;
 
-    setMessages((prev) =>
-      prev.map((m) =>
-        m.id === flagTargetId ? { ...m, flagged: true, feedbackText: feedback } : m
-      )
-    );
+    setOverrides((prev) => {
+      const next = new Map(prev);
+      // Only mark as flagged (reducing risk) on a correct identification.
+      // Wrong flags show feedback but leave the message re-flaggable.
+      next.set(flagTargetId, { flagged: isCorrect, feedbackText: feedback });
+      return next;
+    });
   };
 
   const handleRestart = () => {
-    setMessages([]);
-    setBotIndex(0);
+    // New session ID so the next game gets a fresh Durable Object.
+    // Setting sessionId state causes useAgent to reconnect, which fires onOpen → __GAME_START__.
+    const newId = crypto.randomUUID();
+    sessionStorage.setItem("scam-game-session-id", newId);
+    setOverrides(new Map());
+    setInput("");
     setScore(0);
     setCorrectFlags(0);
     setTotalFlags(0);
     setStreak(0);
-    setRiskLevel(0);
     setFlaggedTactics([]);
-    setMissedTactics([]);
-    setTimeout(() => sendBotMessage(0), 300);
+    gameStartedRef.current = false;
+    clearHistory();
+    setSessionId(newId);
   };
 
-  const accuracy = totalFlags > 0 ? Math.round((correctFlags / totalFlags) * 100) : 100;
+  const getTime = () =>
+    new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+
+  // --- Render ---
 
   return (
     <div className="min-h-screen bg-background flex flex-col">
       {/* Top Bar */}
       <header className="border-b border-border px-4 py-3 flex items-center justify-between bg-card/50 backdrop-blur-sm sticky top-0 z-20">
-        <div className="flex items-center gap-3">
+        <button
+          onClick={() => navigate("/")}
+          className="flex items-center gap-3 hover:opacity-80 transition-opacity"
+        >
           <Shield className="w-5 h-5 text-primary" />
-          <span className="font-mono font-bold">{SCENARIO.name}</span>
-          <Badge variant="outline" className="border-warning text-warning font-mono text-[10px]">
-            {SCENARIO.difficulty}
+          <span className="font-mono font-bold">Bank Account Alert</span>
+          <Badge variant="outline" className={`font-mono text-[10px] ${DIFFICULTY_CLASSES[difficulty]}`}>
+            {DIFFICULTY_LABELS[difficulty]}
           </Badge>
-        </div>
+        </button>
         <div className="flex items-center gap-4">
           <div className="flex items-center gap-1.5">
-            <div className="w-2 h-2 rounded-full bg-success animate-pulse-glow" />
-            <span className="text-xs text-muted-foreground">Connected</span>
+            <div
+              className={`w-2 h-2 rounded-full ${
+                status === "streaming"
+                  ? "bg-warning animate-pulse"
+                  : "bg-success animate-pulse-glow"
+              }`}
+            />
+            <span className="text-xs text-muted-foreground">
+              {status === "streaming" ? "Responding…" : "Connected"}
+            </span>
           </div>
-          <Button variant="ghost" size="sm" onClick={handleRestart} className="text-muted-foreground hover:text-foreground">
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={handleFinish}
+            disabled={botMessages.length === 0}
+            className="gap-1.5 border-primary/40 text-primary hover:bg-primary hover:text-primary-foreground font-mono text-xs"
+          >
+            <Flag className="w-3.5 h-3.5" />
+            Finish
+          </Button>
+          <Button
+            variant="ghost"
+            size="sm"
+            onClick={handleRestart}
+            className="text-muted-foreground hover:text-foreground"
+          >
             <RotateCcw className="w-4 h-4" />
           </Button>
         </div>
@@ -232,22 +290,35 @@ const GameScreen = () => {
 
       {/* Main Area */}
       <div className="flex-1 flex overflow-hidden">
-        {/* Chat Area */}
+        {/* Chat */}
         <div className="flex-1 flex flex-col">
           <div className="flex-1 overflow-y-auto p-4 md:p-6">
             <div className="max-w-2xl mx-auto">
-              {messages.map((msg) => (
-                <ChatMessage
-                  key={msg.id}
-                  sender={msg.sender}
-                  text={msg.text}
-                  timestamp={msg.timestamp}
-                  flagged={msg.flagged}
-                  feedbackText={msg.feedbackText}
-                  onFlag={msg.sender === "bot" ? () => handleFlag(msg.id) : undefined}
-                />
-              ))}
-              {isTyping && <TypingIndicator />}
+              {(() => {
+                let botCount = 0;
+                return displayMessages.map((msg) => {
+                  const text = getMessageText(msg.parts as Part[]);
+                  if (!text.trim()) return null;
+                  // Cap bot messages at the game limit — ignore any extras from agent loops
+                  if (msg.role === "assistant") {
+                    botCount++;
+                    if (botCount > AGENT_MESSAGE_HARD_LIMIT) return null;
+                  }
+                  const override = overrides.get(msg.id);
+                  return (
+                    <ChatMessage
+                      key={msg.id}
+                      sender={msg.role === "assistant" ? "bot" : "user"}
+                      text={text}
+                      timestamp={getTime()}
+                      flagged={override?.flagged}
+                      feedbackText={override?.feedbackText}
+                      onFlag={msg.role === "assistant" ? () => handleFlag(msg.id) : undefined}
+                    />
+                  );
+                });
+              })()}
+              {status === "streaming" && <TypingIndicator />}
               <div ref={chatEndRef} />
             </div>
           </div>
@@ -259,7 +330,8 @@ const GameScreen = () => {
                 <button
                   key={qr}
                   onClick={() => handleSend(qr)}
-                  className="text-xs px-3 py-1.5 rounded-full border border-border text-muted-foreground hover:text-foreground hover:border-glow transition-colors font-mono"
+                  disabled={status === "streaming" || gameOver}
+                  className="text-xs px-3 py-1.5 rounded-full border border-border text-muted-foreground hover:text-foreground hover:border-glow transition-colors font-mono disabled:opacity-40"
                 >
                   {qr}
                 </button>
@@ -274,12 +346,14 @@ const GameScreen = () => {
                 value={input}
                 onChange={(e) => setInput(e.target.value)}
                 onKeyDown={(e) => e.key === "Enter" && handleSend()}
-                placeholder="Type your response..."
+                placeholder="Type your response…"
+                disabled={status === "streaming" || gameOver}
                 className="bg-secondary border-border focus:border-primary font-sans"
               />
               <Button
                 onClick={() => handleSend()}
                 size="icon"
+                disabled={status === "streaming" || gameOver}
                 className="bg-primary text-primary-foreground hover:bg-primary/90 shrink-0"
               >
                 <Send className="w-4 h-4" />
@@ -288,7 +362,7 @@ const GameScreen = () => {
           </div>
         </div>
 
-        {/* Sidebar - desktop only */}
+        {/* Sidebar — desktop only */}
         <aside className="hidden lg:block w-72 border-l border-border p-4 overflow-y-auto bg-card/30">
           <GameSidebar
             score={score}

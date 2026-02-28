@@ -1,0 +1,18 @@
+name = "scam-agent"
+main = "src/index.ts"
+compatibility_date = "2026-02-27"
+compatibility_flags = ["nodejs_compat"]
+
+[assets]
+directory = "../dist"
+
+[ai]
+binding = "AI"
+
+[[durable_objects.bindings]]
+name = "ScamAgent"
+class_name = "ScamAgent"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["ScamAgent"]
